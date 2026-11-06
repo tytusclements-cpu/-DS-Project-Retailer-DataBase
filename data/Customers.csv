@@ -1,0 +1,3 @@
+customer_id,first_name,last_name,email,phone,street_address,city,state,postal_code
+1,Jordan,Lee,jordan.lee@example.com,404-555-0201,15 Oak Street,Atlanta,GA,30303
+2,Morgan,Patel,morgan.patel@example.com,404-555-0202,22 Pine Avenue,Decatur,GA,30030

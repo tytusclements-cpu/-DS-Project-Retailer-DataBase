@@ -1,0 +1,5 @@
+product_id,product_name,brand_id,product_type_id,unit_price
+1,Coca-Cola 12 oz Can,1,1,1.25
+2,Pepsi 12 oz Can,2,1,1.20
+3,Whole Milk 1 Gallon,3,2,3.99
+4,White Bread Loaf,3,3,2.49
