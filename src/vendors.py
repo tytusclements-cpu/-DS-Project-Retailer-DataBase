@@ -1,128 +1,191 @@
-from database import get_connection
+from database import db_session
+from cli_utils import (
+    UserError, delete_by_id, is_valid_email, is_valid_phone,
+    is_valid_postal_code, like_pattern, print_record, print_table,
+    prompt_int, prompt_text, require_row, run_menu,
+)
+
+VENDOR_COLUMNS = """
+    vendor_id, vendor_name, phone, email,
+    street_address, city, state, postal_code
+"""
+
+VENDOR_HEADERS = ["ID", "Name", "Phone", "Email", "City", "State"]
+
+
+def _prompt_vendor_fields(current=None):
+    """
+    Ask for the editable vendor fields.
+    current: (name, phone, email, street, city, state, postal)
+    """
+
+    def default(index):
+        return None if current is None else (current[index] or "")
+
+    return {
+        "vendor_name": prompt_text(
+            "Vendor name", max_len=150, default=default(0)
+        ),
+        "phone": prompt_text(
+            "Phone", required=False, max_len=30, default=default(1),
+            validator=is_valid_phone,
+            error="Phone must be 7-30 digits, spaces, + - ( ) or ."
+        ),
+        "email": prompt_text(
+            "Email", required=False, max_len=150, default=default(2),
+            validator=is_valid_email,
+            error="Please enter a valid email such as name@example.com."
+        ),
+        "street_address": prompt_text(
+            "Street address", required=False, max_len=200,
+            default=default(3)
+        ),
+        "city": prompt_text(
+            "City", required=False, max_len=100, default=default(4)
+        ),
+        "state": prompt_text(
+            "State", required=False, max_len=50, default=default(5)
+        ),
+        "postal_code": prompt_text(
+            "Postal code", required=False, max_len=20, default=default(6),
+            validator=is_valid_postal_code,
+            error="Postal code must be 3-20 letters, digits, spaces or dashes."
+        ),
+    }
+
+
+def _short_rows(rows):
+    return [(r[0], r[1], r[2], r[3], r[5], r[6]) for r in rows]
 
 
 def add_vendor():
-    """Add a new vendor to the database."""
+    """Add a new vendor."""
 
-    print("\n--- Add Vendor ---")
+    print("\n--- Add Vendor (type 'cancel' to stop) ---")
 
-    vendor_name = input("Vendor name: ")
-    phone = input("Phone number: ")
-    email = input("Email address: ")
-    street_address = input("Street address: ")
-    city = input("City: ")
-    state = input("State: ")
-    postal_code = input("Postal code: ")
+    fields = _prompt_vendor_fields()
 
-    connection = get_connection()
-    cursor = connection.cursor()
+    with db_session() as cursor:
+        vendor_id = cursor.var(int)
+        fields["vendor_id"] = vendor_id
 
-    try:
         cursor.execute("""
             INSERT INTO Vendors (
-                vendor_name,
-                phone,
-                email,
-                street_address,
-                city,
-                state,
-                postal_code
+                vendor_name, phone, email,
+                street_address, city, state, postal_code
             )
             VALUES (
-                :vendor_name,
-                :phone,
-                :email,
-                :street_address,
-                :city,
-                :state,
-                :postal_code
+                :vendor_name, :phone, :email,
+                :street_address, :city, :state, :postal_code
             )
-        """, {
-            "vendor_name": vendor_name,
-            "phone": phone,
-            "email": email,
-            "street_address": street_address,
-            "city": city,
-            "state": state,
-            "postal_code": postal_code
-        })
+            RETURNING vendor_id INTO :vendor_id
+        """, fields)
 
-        connection.commit()
-        print("Vendor added successfully!")
-
-    except Exception as error:
-        connection.rollback()
-        print("Error adding vendor:", error)
-
-    finally:
-        cursor.close()
-        connection.close()
+    print(f"Vendor added successfully! Vendor ID: {vendor_id.getvalue()[0]}")
 
 
 def view_vendors():
     """Display all vendors."""
 
-    connection = get_connection()
-    cursor = connection.cursor()
+    with db_session() as cursor:
+        cursor.execute(f"SELECT {VENDOR_COLUMNS} FROM Vendors ORDER BY vendor_id")
+        rows = cursor.fetchall()
 
-    try:
-        cursor.execute("""
-            SELECT vendor_id,
-                   vendor_name,
-                   phone,
-                   email,
-                   street_address,
-                   city,
-                   state,
-                   postal_code
+    print("\n--- Vendor List ---")
+
+    if not rows:
+        print("No vendors found.")
+        return
+
+    print_table(VENDOR_HEADERS, _short_rows(rows))
+
+
+def search_vendors():
+    """Search vendors by name, city, state, or email."""
+
+    print("\n--- Search Vendors ---")
+
+    term = prompt_text("Enter vendor name, city, state, or email")
+
+    with db_session() as cursor:
+        cursor.execute(f"""
+            SELECT {VENDOR_COLUMNS}
             FROM Vendors
-            ORDER BY vendor_id
-        """)
+            WHERE LOWER(vendor_name) LIKE LOWER(:search) ESCAPE '\\'
+               OR LOWER(city) LIKE LOWER(:search) ESCAPE '\\'
+               OR LOWER(state) LIKE LOWER(:search) ESCAPE '\\'
+               OR LOWER(email) LIKE LOWER(:search) ESCAPE '\\'
+            ORDER BY vendor_name
+        """, {"search": like_pattern(term)})
+        rows = cursor.fetchall()
 
-        vendors = cursor.fetchall()
+    if not rows:
+        print("No matching vendors found.")
+        return
 
-        print("\n--- Vendor List ---")
+    print_table(VENDOR_HEADERS, _short_rows(rows))
 
-        if not vendors:
-            print("No vendors found.")
-            return
 
-        for vendor in vendors:
-            print(
-                f"Vendor ID: {vendor[0]} | "
-                f"Name: {vendor[1]} | "
-                f"Phone: {vendor[2]} | "
-                f"Email: {vendor[3]} | "
-                f"Address: {vendor[4]}, "
-                f"{vendor[5]}, {vendor[6]} {vendor[7]}"
-            )
+def view_vendor_details():
+    """Show one vendor with a summary of its reorders."""
 
-    except Exception as error:
-        print("Error viewing vendors:", error)
+    print("\n--- Vendor Details ---")
 
-    finally:
-        cursor.close()
-        connection.close()
+    vendor_id = prompt_int("Enter vendor ID", minimum=1)
+
+    with db_session() as cursor:
+        vendor = require_row(
+            cursor,
+            f"SELECT {VENDOR_COLUMNS} FROM Vendors WHERE vendor_id = :id",
+            {"id": vendor_id}, f"Vendor {vendor_id} not found."
+        )
+
+        cursor.execute("""
+            SELECT reorder_status, COUNT(*)
+            FROM Reorders
+            WHERE vendor_id = :id
+            GROUP BY reorder_status
+            ORDER BY reorder_status
+        """, {"id": vendor_id})
+        by_status = cursor.fetchall()
+
+    print()
+    print_record([
+        ("Vendor ID", vendor[0]),
+        ("Name", vendor[1]),
+        ("Phone", vendor[2]),
+        ("Email", vendor[3]),
+        ("Address", ", ".join(part for part in vendor[4:8] if part)),
+        ("Reorders", sum(row[1] for row in by_status)),
+    ])
+
+    for status, count in by_status:
+        print(f"    {status}: {count}")
 
 
 def update_vendor():
-    """Update an existing vendor's information."""
+    """Update a vendor (press Enter to keep a current value)."""
 
-    print("\n--- Update Vendor ---")
+    print("\n--- Update Vendor (press Enter to keep current value) ---")
 
-    vendor_id = input("Enter vendor ID: ")
-    vendor_name = input("New vendor name: ")
-    phone = input("New phone number: ")
-    email = input("New email address: ")
-    street_address = input("New street address: ")
-    city = input("New city: ")
-    state = input("New state: ")
-    postal_code = input("New postal code: ")
+    vendor_id = prompt_int("Enter vendor ID", minimum=1)
 
-    connection = get_connection()
-    cursor = connection.cursor()
+    with db_session() as cursor:
+        current = require_row(
+            cursor,
+            """
+            SELECT vendor_name, phone, email,
+                   street_address, city, state, postal_code
+            FROM Vendors
+            WHERE vendor_id = :id
+            """,
+            {"id": vendor_id}, f"Vendor {vendor_id} not found."
+        )
 
-    try:
+    fields = _prompt_vendor_fields(current)
+    fields["vendor_id"] = vendor_id
+
+    with db_session() as cursor:
         cursor.execute("""
             UPDATE Vendors
             SET vendor_name = :vendor_name,
@@ -133,202 +196,76 @@ def update_vendor():
                 state = :state,
                 postal_code = :postal_code
             WHERE vendor_id = :vendor_id
-        """, {
-            "vendor_name": vendor_name,
-            "phone": phone,
-            "email": email,
-            "street_address": street_address,
-            "city": city,
-            "state": state,
-            "postal_code": postal_code,
-            "vendor_id": vendor_id
-        })
+        """, fields)
 
         if cursor.rowcount == 0:
-            print("Vendor not found.")
-        else:
-            connection.commit()
-            print("Vendor updated successfully!")
+            raise UserError(f"Vendor {vendor_id} not found.")
 
-    except Exception as error:
-        connection.rollback()
-        print("Error updating vendor:", error)
-
-    finally:
-        cursor.close()
-        connection.close()
+    print("Vendor updated successfully!")
 
 
 def delete_vendor():
-    """Delete a vendor from the database."""
+    """Delete a vendor that has no reorders."""
 
     print("\n--- Delete Vendor ---")
 
-    vendor_id = input("Enter vendor ID: ")
+    vendor_id = prompt_int("Enter vendor ID", minimum=1)
 
-    connection = get_connection()
-    cursor = connection.cursor()
-
-    try:
-        cursor.execute("""
-            DELETE FROM Vendors
-            WHERE vendor_id = :vendor_id
-        """, {
-            "vendor_id": vendor_id
-        })
-
-        if cursor.rowcount == 0:
-            print("Vendor not found.")
-        else:
-            connection.commit()
-            print("Vendor deleted successfully!")
-
-    except Exception as error:
-        connection.rollback()
-        print("Error deleting vendor:", error)
-        print("The vendor may have existing reorder records.")
-
-    finally:
-        cursor.close()
-        connection.close()
-
-
-def search_vendors():
-    """Search vendors by name, city, or email."""
-
-    print("\n--- Search Vendors ---")
-
-    search_term = input("Enter vendor name, city, or email: ")
-
-    connection = get_connection()
-    cursor = connection.cursor()
-
-    try:
-        cursor.execute("""
-            SELECT vendor_id,
-                   vendor_name,
-                   phone,
-                   email,
-                   city,
-                   state
-            FROM Vendors
-            WHERE LOWER(vendor_name) LIKE LOWER(:search)
-               OR LOWER(city) LIKE LOWER(:search)
-               OR LOWER(email) LIKE LOWER(:search)
-            ORDER BY vendor_name
-        """, {
-            "search": f"%{search_term}%"
-        })
-
-        vendors = cursor.fetchall()
-
-        if not vendors:
-            print("No matching vendors found.")
-            return
-
-        for vendor in vendors:
-            print(
-                f"Vendor ID: {vendor[0]} | "
-                f"Name: {vendor[1]} | "
-                f"Phone: {vendor[2]} | "
-                f"Email: {vendor[3]} | "
-                f"Location: {vendor[4]}, {vendor[5]}"
-            )
-
-    except Exception as error:
-        print("Error searching vendors:", error)
-
-    finally:
-        cursor.close()
-        connection.close()
+    delete_by_id(
+        "Vendors", "vendor_id", vendor_id, "vendor", "reorder records"
+    )
 
 
 def view_vendor_reorders():
-    """Display reorder records associated with a vendor."""
+    """Display the reorders placed with a vendor."""
 
     print("\n--- Vendor Reorders ---")
 
-    vendor_id = input("Enter vendor ID: ")
+    vendor_id = prompt_int("Enter vendor ID", minimum=1)
 
-    connection = get_connection()
-    cursor = connection.cursor()
+    with db_session() as cursor:
+        require_row(
+            cursor, "SELECT 1 FROM Vendors WHERE vendor_id = :id",
+            {"id": vendor_id}, f"Vendor {vendor_id} not found."
+        )
 
-    try:
         cursor.execute("""
             SELECT r.reorder_id,
-                   r.store_id,
                    s.store_name,
                    r.reorder_date,
-                   r.reorder_status
+                   r.reorder_status,
+                   NVL(SUM(ri.quantity), 0)
             FROM Reorders r
-            JOIN Stores s
-                ON r.store_id = s.store_id
+            JOIN Stores s ON r.store_id = s.store_id
+            LEFT JOIN Reorder_Items ri ON r.reorder_id = ri.reorder_id
             WHERE r.vendor_id = :vendor_id
+            GROUP BY r.reorder_id, s.store_name, r.reorder_date,
+                     r.reorder_status
             ORDER BY r.reorder_date DESC
-        """, {
-            "vendor_id": vendor_id
-        })
+        """, {"vendor_id": vendor_id})
+        rows = cursor.fetchall()
 
-        reorders = cursor.fetchall()
+    if not rows:
+        print("No reorders found for this vendor.")
+        return
 
-        if not reorders:
-            print("No reorders found for this vendor.")
-            return
-
-        for reorder in reorders:
-            print(
-                f"Reorder ID: {reorder[0]} | "
-                f"Store: {reorder[2]} | "
-                f"Date: {reorder[3]} | "
-                f"Status: {reorder[4]}"
-            )
-
-    except Exception as error:
-        print("Error retrieving vendor reorders:", error)
-
-    finally:
-        cursor.close()
-        connection.close()
+    print_table(
+        ["Reorder ID", "Store", "Date", "Status", "Units ordered"], rows
+    )
 
 
 def vendors_menu():
     """Display the vendor management menu."""
 
-    while True:
-        print("\n===== Vendor Management =====")
-        print("1. Add Vendor")
-        print("2. View Vendors")
-        print("3. Update Vendor")
-        print("4. Delete Vendor")
-        print("5. Search Vendors")
-        print("6. View Vendor Reorders")
-        print("7. Return to Main Menu")
-
-        choice = input("Select an option: ")
-
-        if choice == "1":
-            add_vendor()
-
-        elif choice == "2":
-            view_vendors()
-
-        elif choice == "3":
-            update_vendor()
-
-        elif choice == "4":
-            delete_vendor()
-
-        elif choice == "5":
-            search_vendors()
-
-        elif choice == "6":
-            view_vendor_reorders()
-
-        elif choice == "7":
-            break
-
-        else:
-            print("Invalid option. Please try again.")
+    run_menu("Vendor Management", [
+        ("Add Vendor", add_vendor),
+        ("View Vendors", view_vendors),
+        ("View Vendor Details", view_vendor_details),
+        ("Update Vendor", update_vendor),
+        ("Delete Vendor", delete_vendor),
+        ("Search Vendors", search_vendors),
+        ("View Vendor Reorders", view_vendor_reorders),
+    ])
 
 
 if __name__ == "__main__":
