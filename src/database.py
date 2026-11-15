@@ -1,18 +1,23 @@
 # database.py
 # Handles the connection between the Python application and Oracle Database.
 
+import os
+from contextlib import contextmanager
+
 import oracledb
 
 
 # --------------------------------------------------
 # DATABASE CONFIGURATION
 # --------------------------------------------------
+# Defaults can be overridden with environment variables so the same code can
+# point at a development, test, or production database without editing files.
 
-DB_USER = "your_username"
-DB_PASSWORD = "your_password"
-DB_HOST = "localhost"
-DB_PORT = 1521
-DB_SERVICE = "XEPDB1"
+DB_USER = os.environ.get("RETAIL_DB_USER", "your_username")
+DB_PASSWORD = os.environ.get("RETAIL_DB_PASSWORD", "your_password")
+DB_HOST = os.environ.get("RETAIL_DB_HOST", "localhost")
+DB_PORT = int(os.environ.get("RETAIL_DB_PORT", "1521"))
+DB_SERVICE = os.environ.get("RETAIL_DB_SERVICE", "XEPDB1")
 
 
 # --------------------------------------------------
@@ -34,8 +39,6 @@ def get_connection():
             password=DB_PASSWORD,
             dsn=f"{DB_HOST}:{DB_PORT}/{DB_SERVICE}"
         )
-
-        print("Successfully connected to Oracle Database!")
 
         return connection
 
@@ -125,6 +128,50 @@ def execute_update(sql, parameters=None):
         if 'cursor' in locals():
             cursor.close()
 
+        connection.close()
+
+
+# --------------------------------------------------
+# TRANSACTION HELPER
+# --------------------------------------------------
+
+class DatabaseUnavailableError(Exception):
+    """Raised when a connection to the database cannot be established."""
+
+
+@contextmanager
+def db_session():
+    """
+    Yields a cursor inside one transaction.
+
+    Commits when the block finishes normally, rolls everything back if any
+    exception escapes the block, and always closes the cursor and connection.
+    Use this when several statements must succeed or fail together.
+
+    Raises:
+        DatabaseUnavailableError: if no connection could be made.
+    """
+
+    connection = get_connection()
+
+    if connection is None:
+        raise DatabaseUnavailableError(
+            "Could not connect to the database. "
+            "Check the RETAIL_DB_* settings in database.py."
+        )
+
+    cursor = connection.cursor()
+
+    try:
+        yield cursor
+        connection.commit()
+
+    except Exception:
+        connection.rollback()
+        raise
+
+    finally:
+        cursor.close()
         connection.close()
 
 
