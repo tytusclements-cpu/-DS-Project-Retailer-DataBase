@@ -1,299 +1,349 @@
-from database import get_connection
+from database import db_session
+from cli_utils import (
+    UserError, confirm, fmt_dt, money, print_record, print_table,
+    prompt_int, require_row, run_menu,
+)
+
+MAX_ITEM_QUANTITY = 1_000_000
 
 
-def create_sale():
-    """Create a new in-store sale."""
+# --------------------------------------------------
+# SHARED TRANSACTION STEPS
+# --------------------------------------------------
 
-    print("\n--- Create Sale ---")
+def _sell_item(cursor, sale_id, store_id, product_id, quantity):
+    """
+    Add a product to a sale and take it out of the store's inventory.
 
-    store_id = input("Enter store ID: ")
-    customer_id = input("Enter customer ID (leave blank for anonymous sale): ")
+    Must be called inside a db_session(). The inventory row is locked
+    (FOR UPDATE) so two cashiers cannot sell the same last unit, and any
+    UserError rolls back the whole sale.
+    """
 
-    connection = get_connection()
-    cursor = connection.cursor()
+    _, price = require_row(
+        cursor,
+        "SELECT product_id, unit_price FROM Products WHERE product_id = :id",
+        {"id": product_id}, f"Product {product_id} not found."
+    )
 
-    try:
-        # Verify that the store exists.
+    row = require_row(
+        cursor,
+        """
+        SELECT quantity
+        FROM Inventory
+        WHERE store_id = :store_id AND product_id = :product_id
+        FOR UPDATE
+        """,
+        {"store_id": store_id, "product_id": product_id},
+        f"Product {product_id} is not stocked at store {store_id}."
+    )
+
+    if row[0] < quantity:
+        raise UserError(
+            f"Insufficient stock for product {product_id}: "
+            f"{row[0]} available, {quantity} requested."
+        )
+
+    # Selling the same product twice on one sale merges into one line,
+    # because (sale_id, product_id) is the primary key of Sale_Items.
+    cursor.execute("""
+        UPDATE Sale_Items
+        SET quantity = quantity + :quantity
+        WHERE sale_id = :sale_id AND product_id = :product_id
+    """, {
+        "quantity": quantity, "sale_id": sale_id, "product_id": product_id
+    })
+
+    if cursor.rowcount == 0:
         cursor.execute("""
-            SELECT store_id
-            FROM Stores
-            WHERE store_id = :store_id
-        """, {"store_id": store_id})
+            INSERT INTO Sale_Items (sale_id, product_id, quantity, unit_price)
+            VALUES (:sale_id, :product_id, :quantity, :unit_price)
+        """, {
+            "sale_id": sale_id,
+            "product_id": product_id,
+            "quantity": quantity,
+            "unit_price": price
+        })
 
-        if cursor.fetchone() is None:
-            print("Store not found.")
-            return
+    cursor.execute("""
+        UPDATE Inventory
+        SET quantity = quantity - :quantity
+        WHERE store_id = :store_id AND product_id = :product_id
+    """, {
+        "quantity": quantity, "store_id": store_id, "product_id": product_id
+    })
 
-        # Verify customer if one was provided.
-        if customer_id.strip():
-            cursor.execute("""
-                SELECT customer_id
-                FROM Customers
-                WHERE customer_id = :customer_id
-            """, {"customer_id": customer_id})
+    return price
 
-            if cursor.fetchone() is None:
-                print("Customer not found.")
-                return
+
+def _prompt_store_and_customer():
+    """Ask for a store and an optional customer, and verify both exist."""
+
+    store_id = prompt_int("Enter store ID", minimum=1)
+    customer_id = prompt_int(
+        "Enter customer ID (leave blank for anonymous sale)",
+        minimum=1, required=False
+    )
+
+    with db_session() as cursor:
+        store = require_row(
+            cursor, "SELECT store_name FROM Stores WHERE store_id = :id",
+            {"id": store_id}, f"Store {store_id} not found."
+        )[0]
+
+        customer = None
+
+        if customer_id is not None:
+            first, last = require_row(
+                cursor,
+                "SELECT first_name, last_name FROM Customers "
+                "WHERE customer_id = :id",
+                {"id": customer_id}, f"Customer {customer_id} not found."
+            )
+            customer = f"{first} {last}"
+
+    return store_id, store, customer_id, customer
+
+
+# --------------------------------------------------
+# RECORD A SALE
+# --------------------------------------------------
+
+def record_sale():
+    """Record a complete sale with one or more products in one transaction."""
+
+    print("\n--- Record Sale (type 'cancel' to stop) ---")
+
+    store_id, store_name, customer_id, customer_name = (
+        _prompt_store_and_customer()
+    )
+
+    print(f"\nStore: {store_name}")
+    print(f"Customer: {customer_name or 'Anonymous'}")
+
+    cart = {}   # product_id -> [name, price, quantity]
+
+    while True:
+        product_id = prompt_int("\nProduct ID", minimum=1)
+        quantity = prompt_int(
+            "Quantity", minimum=1, maximum=MAX_ITEM_QUANTITY
+        )
+
+        with db_session() as cursor:
+            name, price = require_row(
+                cursor,
+                "SELECT product_name, unit_price FROM Products "
+                "WHERE product_id = :id",
+                {"id": product_id}, f"Product {product_id} not found."
+            )
+            stock = require_row(
+                cursor,
+                "SELECT quantity FROM Inventory "
+                "WHERE store_id = :store_id AND product_id = :product_id",
+                {"store_id": store_id, "product_id": product_id},
+                f"{name} is not stocked at {store_name}."
+            )[0]
+
+        wanted = quantity + (cart[product_id][2] if product_id in cart else 0)
+
+        if wanted > stock:
+            print(
+                f"Not enough stock for {name}: {stock} available, "
+                f"{wanted} requested. Item not added."
+            )
         else:
-            customer_id = None
+            cart[product_id] = [name, price, wanted]
+            print(f"Added {quantity} x {name} at {money(price)}.")
 
-        # Create the sale and retrieve its generated ID.
-        sale_id_var = cursor.var(int)
+        if not confirm("Add another product"):
+            break
 
+    if not cart:
+        raise UserError("No products were added. Sale not recorded.")
+
+    total = sum(price * qty for _, price, qty in cart.values())
+
+    print("\nSale summary:")
+    print_table(
+        ["Product", "Qty", "Price", "Subtotal"],
+        [(n, q, money(p), money(p * q)) for n, p, q in cart.values()]
+    )
+    print(f"Total: {money(total)}")
+
+    if not confirm("Complete this sale"):
+        raise UserError("Sale not recorded.")
+
+    # All-or-nothing: sale header, all items, and all stock changes.
+    with db_session() as cursor:
+        sale_id = cursor.var(int)
         cursor.execute("""
-            INSERT INTO Sales (
-                store_id, customer_id, sale_date
-            )
-            VALUES (
-                :store_id, :customer_id, CURRENT_TIMESTAMP
-            )
+            INSERT INTO Sales (store_id, customer_id)
+            VALUES (:store_id, :customer_id)
             RETURNING sale_id INTO :sale_id
         """, {
             "store_id": store_id,
             "customer_id": customer_id,
-            "sale_id": sale_id_var
+            "sale_id": sale_id
+        })
+        new_sale_id = sale_id.getvalue()[0]
+
+        for product_id, (_, _, quantity) in cart.items():
+            _sell_item(cursor, new_sale_id, store_id, product_id, quantity)
+
+    print(f"Sale recorded successfully! Sale ID: {new_sale_id}  "
+          f"Total: {money(total)}")
+
+
+def create_sale():
+    """Create an empty sale, to which products can be added later."""
+
+    print("\n--- Create Sale (type 'cancel' to stop) ---")
+
+    store_id, _, customer_id, _ = _prompt_store_and_customer()
+
+    with db_session() as cursor:
+        sale_id = cursor.var(int)
+        cursor.execute("""
+            INSERT INTO Sales (store_id, customer_id)
+            VALUES (:store_id, :customer_id)
+            RETURNING sale_id INTO :sale_id
+        """, {
+            "store_id": store_id,
+            "customer_id": customer_id,
+            "sale_id": sale_id
         })
 
-        sale_id = sale_id_var.getvalue()[0]
-
-        connection.commit()
-
-        print(f"Sale created successfully! Sale ID: {sale_id}")
-
-    except Exception as error:
-        connection.rollback()
-        print("Error creating sale:", error)
-
-    finally:
-        cursor.close()
-        connection.close()
+    print(f"Sale created successfully! Sale ID: {sale_id.getvalue()[0]}")
 
 
 def add_sale_item():
     """Add a product to an existing sale and update inventory."""
 
-    print("\n--- Add Product to Sale ---")
+    print("\n--- Add Product to Sale (type 'cancel' to stop) ---")
 
-    sale_id = input("Enter sale ID: ")
-    product_id = input("Enter product ID: ")
+    sale_id = prompt_int("Enter sale ID", minimum=1)
+    product_id = prompt_int("Enter product ID", minimum=1)
+    quantity = prompt_int("Enter quantity", minimum=1,
+                          maximum=MAX_ITEM_QUANTITY)
 
-    try:
-        quantity = int(input("Enter quantity: "))
+    with db_session() as cursor:
+        store_id = require_row(
+            cursor, "SELECT store_id FROM Sales WHERE sale_id = :id",
+            {"id": sale_id}, f"Sale {sale_id} not found."
+        )[0]
 
-        if quantity <= 0:
-            print("Quantity must be greater than zero.")
-            return
+        _sell_item(cursor, sale_id, store_id, product_id, quantity)
 
-    except ValueError:
-        print("Please enter a valid whole number.")
+        cursor.execute("""
+            SELECT quantity FROM Inventory
+            WHERE store_id = :store_id AND product_id = :product_id
+        """, {"store_id": store_id, "product_id": product_id})
+        remaining = cursor.fetchone()[0]
+
+    print("Product added to sale successfully!")
+    print(f"Inventory remaining at store {store_id}: {remaining}")
+
+
+# --------------------------------------------------
+# RETRIEVE SALES
+# --------------------------------------------------
+
+SALES_LIST_SQL = """
+    SELECT sa.sale_id,
+           sa.sale_date,
+           st.store_name,
+           NVL2(c.customer_id, c.first_name || ' ' || c.last_name, NULL),
+           NVL(SUM(si.quantity), 0),
+           NVL(SUM(si.quantity * si.unit_price), 0)
+    FROM Sales sa
+    JOIN Stores st ON sa.store_id = st.store_id
+    LEFT JOIN Customers c ON sa.customer_id = c.customer_id
+    LEFT JOIN Sale_Items si ON sa.sale_id = si.sale_id
+    {where}
+    GROUP BY sa.sale_id, sa.sale_date, st.store_name,
+             c.customer_id, c.first_name, c.last_name
+    ORDER BY sa.sale_date DESC, sa.sale_id DESC
+"""
+
+SALES_HEADERS = ["Sale ID", "Date", "Store", "Customer", "Units", "Total"]
+
+
+def _print_sales(rows, empty_message):
+    if not rows:
+        print(empty_message)
         return
 
-    connection = get_connection()
-    cursor = connection.cursor()
-
-    try:
-        # Find the store associated with the sale.
-        cursor.execute("""
-            SELECT store_id
-            FROM Sales
-            WHERE sale_id = :sale_id
-        """, {"sale_id": sale_id})
-
-        sale = cursor.fetchone()
-
-        if sale is None:
-            print("Sale not found.")
-            return
-
-        store_id = sale[0]
-
-        # Retrieve the product price.
-        cursor.execute("""
-            SELECT unit_price
-            FROM Products
-            WHERE product_id = :product_id
-        """, {"product_id": product_id})
-
-        product = cursor.fetchone()
-
-        if product is None:
-            print("Product not found.")
-            return
-
-        unit_price = product[0]
-
-        # Lock the inventory record while checking stock.
-        cursor.execute("""
-            SELECT quantity
-            FROM Inventory
-            WHERE store_id = :store_id
-              AND product_id = :product_id
-            FOR UPDATE
-        """, {
-            "store_id": store_id,
-            "product_id": product_id
-        })
-
-        inventory = cursor.fetchone()
-
-        if inventory is None:
-            print("This product is not in the store's inventory.")
-            return
-
-        available_quantity = inventory[0]
-
-        if available_quantity < quantity:
-            print(
-                f"Insufficient inventory. "
-                f"Available quantity: {available_quantity}"
-            )
-            return
-
-        # Insert the product into the sale.
-        cursor.execute("""
-            INSERT INTO Sale_Items (
-                sale_id, product_id, quantity, unit_price
-            )
-            VALUES (
-                :sale_id, :product_id, :quantity, :unit_price
-            )
-        """, {
-            "sale_id": sale_id,
-            "product_id": product_id,
-            "quantity": quantity,
-            "unit_price": unit_price
-        })
-
-        # Subtract purchased quantity from inventory.
-        cursor.execute("""
-            UPDATE Inventory
-            SET quantity = quantity - :quantity
-            WHERE store_id = :store_id
-              AND product_id = :product_id
-        """, {
-            "quantity": quantity,
-            "store_id": store_id,
-            "product_id": product_id
-        })
-
-        connection.commit()
-
-        print("Product added to sale successfully!")
-        print(f"Inventory remaining: {available_quantity - quantity}")
-
-    except Exception as error:
-        connection.rollback()
-        print("Error adding product to sale:", error)
-
-    finally:
-        cursor.close()
-        connection.close()
+    print_table(
+        SALES_HEADERS,
+        [(r[0], fmt_dt(r[1]), r[2], r[3] or "Anonymous", r[4], money(r[5]))
+         for r in rows]
+    )
+    print(f"Combined total: {money(sum(r[5] for r in rows))}")
 
 
 def view_sales():
-    """Display all sales transactions."""
+    """Display all sales."""
 
-    connection = get_connection()
-    cursor = connection.cursor()
+    with db_session() as cursor:
+        cursor.execute(SALES_LIST_SQL.format(where=""))
+        rows = cursor.fetchall()
 
-    try:
-        cursor.execute("""
-            SELECT s.sale_id,
-                   s.store_id,
-                   st.store_name,
-                   s.customer_id,
-                   s.sale_date,
-                   NVL(SUM(si.quantity * si.unit_price), 0) AS total
-            FROM Sales s
-            JOIN Stores st
-                ON s.store_id = st.store_id
-            LEFT JOIN Sale_Items si
-                ON s.sale_id = si.sale_id
-            GROUP BY s.sale_id,
-                     s.store_id,
-                     st.store_name,
-                     s.customer_id,
-                     s.sale_date
-            ORDER BY s.sale_date DESC
-        """)
-
-        sales = cursor.fetchall()
-
-        print("\n--- Sales Transactions ---")
-
-        if not sales:
-            print("No sales found.")
-            return
-
-        for sale in sales:
-            print(
-                f"Sale ID: {sale[0]} | "
-                f"Store: {sale[2]} | "
-                f"Customer ID: {sale[3]} | "
-                f"Date: {sale[4]} | "
-                f"Total: ${sale[5]:.2f}"
-            )
-
-    except Exception as error:
-        print("Error viewing sales:", error)
-
-    finally:
-        cursor.close()
-        connection.close()
+    print("\n--- Sales Transactions ---")
+    _print_sales(rows, "No sales found.")
 
 
 def view_sale_details():
-    """Display products included in a specific sale."""
+    """Display one sale and the products in it."""
 
     print("\n--- Sale Details ---")
 
-    sale_id = input("Enter sale ID: ")
+    sale_id = prompt_int("Enter sale ID", minimum=1)
 
-    connection = get_connection()
-    cursor = connection.cursor()
+    with db_session() as cursor:
+        sale = require_row(
+            cursor,
+            """
+            SELECT sa.sale_id, sa.sale_date, st.store_name,
+                   NVL2(c.customer_id, c.first_name || ' ' || c.last_name, NULL)
+            FROM Sales sa
+            JOIN Stores st ON sa.store_id = st.store_id
+            LEFT JOIN Customers c ON sa.customer_id = c.customer_id
+            WHERE sa.sale_id = :id
+            """,
+            {"id": sale_id}, f"Sale {sale_id} not found."
+        )
 
-    try:
         cursor.execute("""
             SELECT si.product_id,
                    p.product_name,
                    si.quantity,
                    si.unit_price,
-                   si.quantity * si.unit_price AS subtotal
+                   si.quantity * si.unit_price
             FROM Sale_Items si
-            JOIN Products p
-                ON si.product_id = p.product_id
-            WHERE si.sale_id = :sale_id
-        """, {"sale_id": sale_id})
-
+            JOIN Products p ON si.product_id = p.product_id
+            WHERE si.sale_id = :id
+            ORDER BY p.product_name
+        """, {"id": sale_id})
         items = cursor.fetchall()
 
-        if not items:
-            print("No items found for this sale.")
-            return
+    print()
+    print_record([
+        ("Sale ID", sale[0]),
+        ("Date", fmt_dt(sale[1])),
+        ("Store", sale[2]),
+        ("Customer", sale[3] or "Anonymous"),
+    ])
 
-        total = 0
+    if not items:
+        print("\nThis sale has no products yet.")
+        return
 
-        print(f"\nSale ID: {sale_id}")
-
-        for item in items:
-            print(
-                f"Product: {item[1]} | "
-                f"Quantity: {item[2]} | "
-                f"Price: ${item[3]:.2f} | "
-                f"Subtotal: ${item[4]:.2f}"
-            )
-
-            total += item[4]
-
-        print(f"\nSale Total: ${total:.2f}")
-
-    except Exception as error:
-        print("Error retrieving sale details:", error)
-
-    finally:
-        cursor.close()
-        connection.close()
+    print()
+    print_table(
+        ["Product ID", "Product", "Qty", "Unit price", "Subtotal"],
+        [(r[0], r[1], r[2], money(r[3]), money(r[4])) for r in items]
+    )
+    print(f"Sale total: {money(sum(r[4] for r in items))}")
 
 
 def search_sales_by_store():
@@ -301,73 +351,116 @@ def search_sales_by_store():
 
     print("\n--- Search Sales by Store ---")
 
-    store_id = input("Enter store ID: ")
+    store_id = prompt_int("Enter store ID", minimum=1)
 
-    connection = get_connection()
-    cursor = connection.cursor()
+    with db_session() as cursor:
+        require_row(
+            cursor, "SELECT 1 FROM Stores WHERE store_id = :id",
+            {"id": store_id}, f"Store {store_id} not found."
+        )
+        cursor.execute(
+            SALES_LIST_SQL.format(where="WHERE sa.store_id = :store_id"),
+            {"store_id": store_id}
+        )
+        rows = cursor.fetchall()
 
-    try:
-        cursor.execute("""
-            SELECT s.sale_id,
-                   s.sale_date,
-                   NVL(SUM(si.quantity * si.unit_price), 0) AS total
-            FROM Sales s
-            LEFT JOIN Sale_Items si
-                ON s.sale_id = si.sale_id
-            WHERE s.store_id = :store_id
-            GROUP BY s.sale_id, s.sale_date
-            ORDER BY s.sale_date DESC
-        """, {"store_id": store_id})
+    _print_sales(rows, "No sales found for this store.")
 
-        sales = cursor.fetchall()
 
-        if not sales:
-            print("No sales found for this store.")
-            return
+def search_sales_by_customer():
+    """Find sales made by a particular customer."""
 
-        for sale in sales:
-            print(
-                f"Sale ID: {sale[0]} | "
-                f"Date: {sale[1]} | "
-                f"Total: ${sale[2]:.2f}"
-            )
+    print("\n--- Search Sales by Customer ---")
 
-    except Exception as error:
-        print("Error searching sales:", error)
+    customer_id = prompt_int("Enter customer ID", minimum=1)
 
-    finally:
-        cursor.close()
-        connection.close()
+    with db_session() as cursor:
+        require_row(
+            cursor, "SELECT 1 FROM Customers WHERE customer_id = :id",
+            {"id": customer_id}, f"Customer {customer_id} not found."
+        )
+        cursor.execute(
+            SALES_LIST_SQL.format(
+                where="WHERE sa.customer_id = :customer_id"
+            ),
+            {"customer_id": customer_id}
+        )
+        rows = cursor.fetchall()
+
+    _print_sales(rows, "No sales found for this customer.")
+
+
+# --------------------------------------------------
+# VOID A SALE
+# --------------------------------------------------
+
+def void_sale():
+    """Delete a sale and return its products to the store's inventory."""
+
+    print("\n--- Void Sale ---")
+
+    sale_id = prompt_int("Enter sale ID", minimum=1)
+
+    if not confirm(f"Void sale {sale_id} and restore its stock"):
+        print("Void cancelled.")
+        return
+
+    with db_session() as cursor:
+        store_id = require_row(
+            cursor, "SELECT store_id FROM Sales WHERE sale_id = :id",
+            {"id": sale_id}, f"Sale {sale_id} not found."
+        )[0]
+
+        cursor.execute(
+            "SELECT product_id, quantity FROM Sale_Items WHERE sale_id = :id",
+            {"id": sale_id}
+        )
+        items = cursor.fetchall()
+
+        for product_id, quantity in items:
+            # MERGE restores stock even if the inventory row was deleted.
+            cursor.execute("""
+                MERGE INTO Inventory i
+                USING (SELECT :store_id AS store_id,
+                              :product_id AS product_id
+                       FROM dual) src
+                ON (i.store_id = src.store_id
+                    AND i.product_id = src.product_id)
+                WHEN MATCHED THEN
+                    UPDATE SET i.quantity = i.quantity + :quantity
+                WHEN NOT MATCHED THEN
+                    INSERT (store_id, product_id, quantity)
+                    VALUES (src.store_id, src.product_id, :quantity)
+            """, {
+                "store_id": store_id,
+                "product_id": product_id,
+                "quantity": quantity
+            })
+
+        cursor.execute(
+            "DELETE FROM Sale_Items WHERE sale_id = :id", {"id": sale_id}
+        )
+        cursor.execute(
+            "DELETE FROM Sales WHERE sale_id = :id", {"id": sale_id}
+        )
+
+    print(f"Sale {sale_id} voided. Restored {len(items)} product line(s) "
+          f"to inventory.")
 
 
 def sales_menu():
     """Display the sales management menu."""
 
-    while True:
-        print("\n===== Sales Management =====")
-        print("1. Create Sale")
-        print("2. Add Product to Sale")
-        print("3. View All Sales")
-        print("4. View Sale Details")
-        print("5. Search Sales by Store")
-        print("6. Return to Main Menu")
-
-        choice = input("Select an option: ")
-
-        if choice == "1":
-            create_sale()
-        elif choice == "2":
-            add_sale_item()
-        elif choice == "3":
-            view_sales()
-        elif choice == "4":
-            view_sale_details()
-        elif choice == "5":
-            search_sales_by_store()
-        elif choice == "6":
-            break
-        else:
-            print("Invalid option. Please try again.")
+    run_menu("Sales Management", [
+        ("Record Sale (multiple products)", record_sale),
+        ("Create Empty Sale", create_sale),
+        ("Add Product to Existing Sale", add_sale_item),
+        ("View All Sales", view_sales),
+        ("View Sale Details", view_sale_details),
+        ("Search Sales by Store", search_sales_by_store),
+        ("Search Sales by Customer", search_sales_by_customer),
+        ("Void Sale", void_sale),
+    ])
 
 
 if __name__ == "__main__":
