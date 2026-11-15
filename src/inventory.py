@@ -1,48 +1,79 @@
-from database import get_connection
+from database import db_session
+from cli_utils import (
+    UserError, confirm, like_pattern, print_table, prompt_int, prompt_text,
+    require_row, run_menu,
+)
+
+# NUMBER(10) in the schema
+MAX_QUANTITY = 9_999_999_999
+
+INVENTORY_HEADERS = ["Store ID", "Store", "Product ID", "Product", "Quantity"]
+
+
+def _store_name(cursor, store_id):
+    return require_row(
+        cursor, "SELECT store_name FROM Stores WHERE store_id = :id",
+        {"id": store_id}, f"Store {store_id} not found."
+    )[0]
+
+
+def _product_name(cursor, product_id):
+    return require_row(
+        cursor, "SELECT product_name FROM Products WHERE product_id = :id",
+        {"id": product_id}, f"Product {product_id} not found."
+    )[0]
+
+
+def _print_inventory(rows, empty_message):
+    if not rows:
+        print(empty_message)
+        return
+
+    print_table(INVENTORY_HEADERS, rows)
+
+
+INVENTORY_SELECT = """
+    SELECT i.store_id,
+           s.store_name,
+           i.product_id,
+           p.product_name,
+           i.quantity
+    FROM Inventory i
+    JOIN Stores s ON i.store_id = s.store_id
+    JOIN Products p ON i.product_id = p.product_id
+"""
 
 
 def view_inventory():
     """Display inventory for all stores."""
 
-    connection = get_connection()
-    cursor = connection.cursor()
+    with db_session() as cursor:
+        cursor.execute(INVENTORY_SELECT + " ORDER BY s.store_name, p.product_name")
+        rows = cursor.fetchall()
 
-    try:
-        cursor.execute("""
-            SELECT i.store_id,
-                   s.store_name,
-                   i.product_id,
-                   p.product_name,
-                   i.quantity
-            FROM Inventory i
-            JOIN Stores s ON i.store_id = s.store_id
-            JOIN Products p ON i.product_id = p.product_id
-            ORDER BY i.store_id, p.product_name
-        """)
+    print("\n--- Inventory List ---")
+    _print_inventory(rows, "No inventory records found.")
 
-        records = cursor.fetchall()
 
-        print("\n--- Inventory List ---")
+def view_inventory_by_store():
+    """Display inventory for a single store."""
 
-        if not records:
-            print("No inventory records found.")
-            return
+    print("\n--- Inventory by Store ---")
 
-        for record in records:
-            print(
-                f"Store ID: {record[0]} | "
-                f"Store: {record[1]} | "
-                f"Product ID: {record[2]} | "
-                f"Product: {record[3]} | "
-                f"Quantity: {record[4]}"
-            )
+    store_id = prompt_int("Enter store ID", minimum=1)
 
-    except Exception as error:
-        print("Error viewing inventory:", error)
+    with db_session() as cursor:
+        name = _store_name(cursor, store_id)
 
-    finally:
-        cursor.close()
-        connection.close()
+        cursor.execute(
+            INVENTORY_SELECT +
+            " WHERE i.store_id = :store_id ORDER BY p.product_name",
+            {"store_id": store_id}
+        )
+        rows = cursor.fetchall()
+
+    print(f"\nInventory for {name}:")
+    _print_inventory(rows, "This store has no inventory records.")
 
 
 def search_inventory():
@@ -50,124 +81,124 @@ def search_inventory():
 
     print("\n--- Search Inventory ---")
 
-    search_term = input("Enter store ID or product name: ")
+    term = prompt_text("Enter store ID or product name")
 
-    connection = get_connection()
-    cursor = connection.cursor()
-
-    try:
-        cursor.execute("""
-            SELECT i.store_id,
-                   s.store_name,
-                   p.product_name,
-                   i.quantity
-            FROM Inventory i
-            JOIN Stores s ON i.store_id = s.store_id
-            JOIN Products p ON i.product_id = p.product_id
+    with db_session() as cursor:
+        cursor.execute(INVENTORY_SELECT + """
             WHERE TO_CHAR(i.store_id) = :search
-               OR LOWER(p.product_name) LIKE LOWER(:product_search)
+               OR LOWER(p.product_name) LIKE LOWER(:product_search) ESCAPE '\\'
             ORDER BY s.store_name, p.product_name
-        """, {
-            "search": search_term,
-            "product_search": f"%{search_term}%"
-        })
+        """, {"search": term, "product_search": like_pattern(term)})
+        rows = cursor.fetchall()
 
-        records = cursor.fetchall()
+    _print_inventory(rows, "No matching inventory records found.")
 
-        if not records:
-            print("No matching inventory records found.")
-            return
 
-        for record in records:
-            print(
-                f"Store ID: {record[0]} | "
-                f"Store: {record[1]} | "
-                f"Product: {record[2]} | "
-                f"Quantity: {record[3]}"
-            )
+def check_availability():
+    """Show where a product is in stock and how many units exist in total."""
 
-    except Exception as error:
-        print("Error searching inventory:", error)
+    print("\n--- Check Product Availability ---")
 
-    finally:
-        cursor.close()
-        connection.close()
+    term = prompt_text("Enter product ID or product name")
+
+    with db_session() as cursor:
+        cursor.execute("""
+            SELECT p.product_id,
+                   p.product_name,
+                   s.store_id,
+                   s.store_name,
+                   i.quantity
+            FROM Products p
+            LEFT JOIN Inventory i ON p.product_id = i.product_id
+            LEFT JOIN Stores s ON i.store_id = s.store_id
+            WHERE TO_CHAR(p.product_id) = :search
+               OR LOWER(p.product_name) LIKE LOWER(:name_search) ESCAPE '\\'
+            ORDER BY p.product_name, s.store_name
+        """, {"search": term, "name_search": like_pattern(term)})
+        rows = cursor.fetchall()
+
+    if not rows:
+        print("No matching products found.")
+        return
+
+    totals = {}
+
+    for product_id, product_name, _, _, quantity in rows:
+        entry = totals.setdefault(product_id, [product_name, 0])
+        entry[1] += quantity or 0
+
+    print_table(
+        ["Product ID", "Product", "Store ID", "Store", "Quantity"], rows
+    )
+
+    print()
+
+    for product_id, (product_name, total) in totals.items():
+        status = "IN STOCK" if total > 0 else "OUT OF STOCK"
+        print(f"{product_name} (ID {product_id}): {total} units total - {status}")
+
+
+def low_stock():
+    """List inventory records at or below a quantity threshold."""
+
+    print("\n--- Low Stock Report ---")
+
+    threshold = prompt_int(
+        "Show items with quantity at or below", minimum=0,
+        maximum=MAX_QUANTITY, default=20
+    )
+
+    with db_session() as cursor:
+        cursor.execute(
+            INVENTORY_SELECT +
+            " WHERE i.quantity <= :threshold "
+            "ORDER BY i.quantity, s.store_name, p.product_name",
+            {"threshold": threshold}
+        )
+        rows = cursor.fetchall()
+
+    _print_inventory(
+        rows, f"No products have {threshold} or fewer units in stock."
+    )
 
 
 def add_inventory():
-    """Add a product to a store's inventory."""
+    """Stock a product at a store."""
 
-    print("\n--- Add Inventory ---")
+    print("\n--- Add Inventory (type 'cancel' to stop) ---")
 
-    store_id = input("Enter store ID: ")
-    product_id = input("Enter product ID: ")
-    quantity = input("Enter quantity: ")
+    store_id = prompt_int("Enter store ID", minimum=1)
+    product_id = prompt_int("Enter product ID", minimum=1)
+    quantity = prompt_int("Enter quantity", minimum=0, maximum=MAX_QUANTITY)
 
-    try:
-        quantity = int(quantity)
+    with db_session() as cursor:
+        store = _store_name(cursor, store_id)
+        product = _product_name(cursor, product_id)
 
-        if quantity < 0:
-            print("Quantity cannot be negative.")
-            return
-
-    except ValueError:
-        print("Please enter a valid whole number.")
-        return
-
-    connection = get_connection()
-    cursor = connection.cursor()
-
-    try:
         cursor.execute("""
-            INSERT INTO Inventory (
-                store_id, product_id, quantity
-            )
-            VALUES (
-                :store_id, :product_id, :quantity
-            )
+            INSERT INTO Inventory (store_id, product_id, quantity)
+            VALUES (:store_id, :product_id, :quantity)
         """, {
             "store_id": store_id,
             "product_id": product_id,
             "quantity": quantity
         })
 
-        connection.commit()
-        print("Inventory record added successfully!")
-
-    except Exception as error:
-        connection.rollback()
-        print("Error adding inventory:", error)
-        print("Check that the store and product exist and the record is not already present.")
-
-    finally:
-        cursor.close()
-        connection.close()
+    print(f"Added {quantity} x {product} to {store}.")
 
 
 def update_inventory():
-    """Update the quantity of an existing inventory record."""
+    """Set the quantity of an existing inventory record."""
 
-    print("\n--- Update Inventory ---")
+    print("\n--- Update Inventory (set exact quantity) ---")
 
-    store_id = input("Enter store ID: ")
-    product_id = input("Enter product ID: ")
-    quantity = input("Enter new quantity: ")
+    store_id = prompt_int("Enter store ID", minimum=1)
+    product_id = prompt_int("Enter product ID", minimum=1)
+    quantity = prompt_int(
+        "Enter new quantity", minimum=0, maximum=MAX_QUANTITY
+    )
 
-    try:
-        quantity = int(quantity)
-
-        if quantity < 0:
-            print("Quantity cannot be negative.")
-            return
-
-    except ValueError:
-        print("Please enter a valid whole number.")
-        return
-
-    connection = get_connection()
-    cursor = connection.cursor()
-
-    try:
+    with db_session() as cursor:
         cursor.execute("""
             UPDATE Inventory
             SET quantity = :quantity
@@ -180,18 +211,66 @@ def update_inventory():
         })
 
         if cursor.rowcount == 0:
-            print("Inventory record not found.")
-        else:
-            connection.commit()
-            print("Inventory updated successfully!")
+            raise UserError("Inventory record not found for that store and product.")
 
-    except Exception as error:
-        connection.rollback()
-        print("Error updating inventory:", error)
+    print("Inventory updated successfully!")
 
-    finally:
-        cursor.close()
-        connection.close()
+
+def adjust_inventory():
+    """Add or remove units (positive or negative change)."""
+
+    print("\n--- Adjust Inventory (+ receive stock, - remove stock) ---")
+
+    store_id = prompt_int("Enter store ID", minimum=1)
+    product_id = prompt_int("Enter product ID", minimum=1)
+    change = prompt_int(
+        "Change in quantity (e.g. 25 or -5)",
+        minimum=-MAX_QUANTITY, maximum=MAX_QUANTITY
+    )
+
+    if change == 0:
+        raise UserError("A change of 0 does nothing.")
+
+    with db_session() as cursor:
+        # The WHERE clause makes the check-and-update a single atomic step,
+        # so stock can never go negative even with concurrent users.
+        cursor.execute("""
+            UPDATE Inventory
+            SET quantity = quantity + :change
+            WHERE store_id = :store_id
+              AND product_id = :product_id
+              AND quantity + :change >= 0
+        """, {
+            "change": change,
+            "store_id": store_id,
+            "product_id": product_id
+        })
+
+        if cursor.rowcount == 0:
+            cursor.execute("""
+                SELECT quantity
+                FROM Inventory
+                WHERE store_id = :store_id AND product_id = :product_id
+            """, {"store_id": store_id, "product_id": product_id})
+            row = cursor.fetchone()
+
+            if row is None:
+                raise UserError(
+                    "Inventory record not found for that store and product."
+                )
+
+            raise UserError(
+                f"Cannot remove {-change} units: only {row[0]} in stock."
+            )
+
+        cursor.execute("""
+            SELECT quantity
+            FROM Inventory
+            WHERE store_id = :store_id AND product_id = :product_id
+        """, {"store_id": store_id, "product_id": product_id})
+        new_quantity = cursor.fetchone()[0]
+
+    print(f"Inventory adjusted. New quantity: {new_quantity}")
 
 
 def delete_inventory():
@@ -199,65 +278,40 @@ def delete_inventory():
 
     print("\n--- Delete Inventory ---")
 
-    store_id = input("Enter store ID: ")
-    product_id = input("Enter product ID: ")
+    store_id = prompt_int("Enter store ID", minimum=1)
+    product_id = prompt_int("Enter product ID", minimum=1)
 
-    connection = get_connection()
-    cursor = connection.cursor()
+    if not confirm("Remove this inventory record"):
+        print("Delete cancelled.")
+        return
 
-    try:
+    with db_session() as cursor:
         cursor.execute("""
             DELETE FROM Inventory
             WHERE store_id = :store_id
               AND product_id = :product_id
-        """, {
-            "store_id": store_id,
-            "product_id": product_id
-        })
+        """, {"store_id": store_id, "product_id": product_id})
 
         if cursor.rowcount == 0:
-            print("Inventory record not found.")
-        else:
-            connection.commit()
-            print("Inventory record deleted successfully!")
+            raise UserError("Inventory record not found for that store and product.")
 
-    except Exception as error:
-        connection.rollback()
-        print("Error deleting inventory:", error)
-
-    finally:
-        cursor.close()
-        connection.close()
+    print("Inventory record deleted successfully!")
 
 
 def inventory_menu():
     """Display the inventory management menu."""
 
-    while True:
-        print("\n===== Inventory Management =====")
-        print("1. View Inventory")
-        print("2. Search Inventory")
-        print("3. Add Inventory")
-        print("4. Update Inventory")
-        print("5. Delete Inventory")
-        print("6. Return to Main Menu")
-
-        choice = input("Select an option: ")
-
-        if choice == "1":
-            view_inventory()
-        elif choice == "2":
-            search_inventory()
-        elif choice == "3":
-            add_inventory()
-        elif choice == "4":
-            update_inventory()
-        elif choice == "5":
-            delete_inventory()
-        elif choice == "6":
-            break
-        else:
-            print("Invalid option. Please try again.")
+    run_menu("Inventory Management", [
+        ("View All Inventory", view_inventory),
+        ("View Inventory by Store", view_inventory_by_store),
+        ("Search Inventory", search_inventory),
+        ("Check Product Availability", check_availability),
+        ("Low Stock Report", low_stock),
+        ("Add Inventory Record", add_inventory),
+        ("Set Quantity", update_inventory),
+        ("Adjust Quantity (+/-)", adjust_inventory),
+        ("Delete Inventory Record", delete_inventory),
+    ])
 
 
 if __name__ == "__main__":
