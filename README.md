@@ -70,12 +70,15 @@ DS-Project-Retailer-DataBase/
 │   ├── sales.py
 │   ├── orders.py
 │   ├── vendors.py
-│   └── reports.py
+│   ├── reports.py
+│   ├── gui.py
+│   └── gui_*.py
 │
 ├── tests/
 │   ├── test_database.py
 │   ├── test_inventory.py
 │   ├── test_sales.py
+│   ├── test_gui.py
 │   └── test_concurrency.py
 │
 └── data/
@@ -266,6 +269,24 @@ py src/main.py
 
 The application will display the main menu.
 
+### Step 7: Start the Graphical Interface (Optional)
+
+The same system is also available as a desktop application built with Tkinter, which is included with Python. No extra packages are required.
+
+```bash
+py src/gui.py
+```
+
+The graphical interface provides a dashboard and screens for products, stores, customers, vendors, inventory, sales, online orders, vendor reorders, and reports.
+
+- Click a column heading to sort a table. Use the **Search** box to filter the rows shown.
+- Select a row to see its details. Double-click a row to edit it.
+- New sales, online orders, and reorders open a product picker. A sale only offers products that the selected store has in stock.
+- Reports can be exported to CSV.
+- Keyboard shortcuts: **F5** refreshes, **Ctrl+F** moves to search, and **Ctrl+1** to **Ctrl+8** switch screens.
+
+If the application cannot connect to the database, a sign-in window asks for the user, password, host, port, and service name. **Change connection** in the sidebar switches databases later. The console application and the graphical interface use the same database code and can be used side by side.
+
 ## 8. Running Tests
 
 Run the database tests:
@@ -286,6 +307,12 @@ py -m unittest tests.test_inventory -v
 
 ```bash
 py -m unittest tests.test_sales -v
+```
+
+Run the graphical interface tests. These need a display but no database:
+
+```bash
+py -m unittest tests.test_gui -v
 ```
 
 Run the concurrency test:
