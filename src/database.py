@@ -19,6 +19,10 @@ DB_HOST = os.environ.get("RETAIL_DB_HOST", "localhost")
 DB_PORT = int(os.environ.get("RETAIL_DB_PORT", "1521"))
 DB_SERVICE = os.environ.get("RETAIL_DB_SERVICE", "XEPDB1")
 
+# Why the most recent execute_query() returned nothing (None = it worked).
+# Lets the graphical interface tell "no rows" apart from "query failed".
+last_query_error = None
+
 
 # --------------------------------------------------
 # CREATE DATABASE CONNECTION
@@ -63,9 +67,13 @@ def execute_query(sql, parameters=None):
         List of rows returned by the query.
     """
 
+    global last_query_error
+
+    last_query_error = None
     connection = get_connection()
 
     if connection is None:
+        last_query_error = "Could not connect to the database."
         return []
 
     try:
@@ -78,6 +86,7 @@ def execute_query(sql, parameters=None):
         return results
 
     except oracledb.Error as error:
+        last_query_error = str(error)
         print("Query execution failed:", error)
         return []
 
